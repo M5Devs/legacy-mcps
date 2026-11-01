@@ -27,6 +27,7 @@ import os
 import posixpath
 import socket
 import stat
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,24 @@ DEFAULT_TIMEOUT = 60.0
 _FORBIDDEN_NAME_CHARS = set('&:%?/*$|{;^}<>"\'')
 #: SourceForge caps a single FRS path at this many characters.
 MAX_PATH_LENGTH = 255
+
+#: Text paramiko puts in the error for an unsupported SFTP operation
+#: (``SFTP_OP_UNSUPPORTED`` maps to ``IOError("Operation unsupported")``).
+_UNSUPPORTED_OPERATION = "unsupported"
+
+
+def _posix_rename_unsupported(exc: BaseException) -> bool:
+    """True only when the server rejected ``posix_rename`` as unsupported.
+
+    An SFTP server without the ``posix-rename@openssh.com`` extension answers
+    the request with ``SFTP_OP_UNSUPPORTED``, which paramiko turns into an
+    ``IOError`` with no ``errno``. Anything else -- a connection drop, a
+    permission error, a generic server failure -- carries an ``errno`` or a
+    different message and must not be treated as a missing extension.
+    """
+    if not isinstance(exc, OSError) or getattr(exc, "errno", None) is not None:
+        return False
+    return _UNSUPPORTED_OPERATION in str(exc).lower()
 
 
 def validate_remote_path(remote_path: str) -> str:
@@ -333,7 +352,8 @@ class SourceForgeFRSClient:
                     detail=str(exc),
                 )
         if during_write and isinstance(
-            exc, (EOFError, ConnectionError, paramiko.ssh_exception.SSHException)
+            exc,
+            (EOFError, ConnectionError, OSError, paramiko.ssh_exception.SSHException),
         ):
             return AmbiguousWriteError(
                 "The connection dropped during the upload and its outcome is "
@@ -406,7 +426,9 @@ class SourceForgeFRSClient:
         directory = self.ensure_remote_directory(remote_dir)
 
         destination = posixpath.join(directory, name)
-        staging = f"{destination}.part-{os.getpid()}"
+        # A unique suffix keeps concurrent uploads of the same name from
+        # colliding on one staging path within this process.
+        staging = f"{destination}.part-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
         sftp = self._sftp_session()
         try:
@@ -422,7 +444,12 @@ class SourceForgeFRSClient:
                         # posix-rename@openssh.com replaces the target atomically,
                         # so the published file is never missing mid-swap.
                         sftp.posix_rename(staging, destination)
-                    except IOError:
+                    except OSError as exc:
+                        if not _posix_rename_unsupported(exc):
+                            # A real failure (dropped connection, permission
+                            # error, ...) must surface, not be masked by the
+                            # non-atomic fallback.
+                            raise
                         # Server lacks the extension: fall back to remove+rename.
                         if self._exists(sftp, destination):
                             sftp.remove(destination)

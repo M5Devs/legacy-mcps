@@ -9,6 +9,8 @@ mismatch) use a substituted transport.
 
 from __future__ import annotations
 
+import errno
+import threading
 from pathlib import Path
 
 import paramiko
@@ -274,6 +276,138 @@ def test_download_url_percent_encodes_path(sftp_server, sftp_key_file, tmp_path)
         f"https://sourceforge.net/projects/{PROJECT}/files/"
         "releases/my%20file%231.bin/download"
     )
+
+
+def test_concurrent_uploads_use_distinct_staging_paths(
+    sftp_server, sftp_key_file, tmp_path, monkeypatch
+):
+    """Two uploads of the same name must not share one staging path.
+
+    Each thread drives its own client (and so its own SSH session), which is how
+    concurrent uploads actually happen. The ``put`` wrapper holds both threads at
+    the staging write until they have both arrived, so the two staging paths are
+    chosen while both uploads are in flight.
+    """
+    source = tmp_path / "artifact.bin"
+    source.write_bytes(b"payload")
+
+    clients = [_client(sftp_server, sftp_key_file) for _ in range(2)]
+    staging_paths: list[str] = []
+    lock = threading.Lock()
+    real_put = paramiko.SFTPClient.put
+    barrier = threading.Barrier(2)
+
+    def record_put(self, localpath, remotepath, callback=None, confirm=True):
+        with lock:
+            staging_paths.append(remotepath)
+        barrier.wait(timeout=30)
+        return real_put(self, localpath, remotepath, callback=callback, confirm=confirm)
+
+    # The destination is forced to look absent so neither writer stops at the
+    # overwrite guard before the other has staged its bytes.
+    monkeypatch.setattr(paramiko.SFTPClient, "put", record_put)
+    monkeypatch.setattr(
+        SourceForgeFRSClient, "_exists", staticmethod(lambda sftp, path: False)
+    )
+
+    def upload(client):
+        client.upload_file(str(source), "releases")
+
+    try:
+        threads = [
+            threading.Thread(target=upload, args=(client,)) for client in clients
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        assert all(not thread.is_alive() for thread in threads)
+    finally:
+        for client in clients:
+            client.close()
+
+    assert len(staging_paths) == 2
+    assert staging_paths[0] != staging_paths[1]
+    assert all(".part-" in path for path in staging_paths)
+
+
+def test_plain_oserror_during_upload_is_ambiguous_write(
+    sftp_server, sftp_key_file, tmp_path, monkeypatch
+):
+    """A bare OSError while writing is not safe to retry blindly."""
+    source = tmp_path / "artifact.bin"
+    source.write_bytes(b"payload")
+
+    client = _client(sftp_server, sftp_key_file)
+
+    def failing_put(self, localpath, remotepath, callback=None, confirm=True):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(paramiko.SFTPClient, "put", failing_put)
+    try:
+        with pytest.raises(AmbiguousWriteError) as excinfo:
+            client.upload_file(str(source), "releases")
+        assert excinfo.value.to_dict()["retryable"] is False
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        # An OSError that carries an errno is a real I/O failure, not a missing
+        # extension: the broad "catch every OSError" version masked exactly this.
+        OSError(errno.ECONNRESET, "Connection reset by peer"),
+        paramiko.ssh_exception.SSHException("Socket is closed"),
+    ],
+)
+def test_failure_during_posix_rename_is_not_masked(
+    sftp_server, sftp_key_file, tmp_path, monkeypatch, failure
+):
+    """A real failure during the atomic rename must surface, not fall back."""
+    source = tmp_path / "artifact.bin"
+    source.write_bytes(b"first")
+
+    client = _client(sftp_server, sftp_key_file)
+    try:
+        client.upload_file(str(source), "releases")
+
+        rename_calls: list[tuple[str, str]] = []
+
+        def dropping_posix_rename(self, oldpath, newpath):
+            raise failure
+
+        def recording_rename(self, oldpath, newpath):
+            rename_calls.append((oldpath, newpath))
+
+        monkeypatch.setattr(paramiko.SFTPClient, "posix_rename", dropping_posix_rename)
+        monkeypatch.setattr(paramiko.SFTPClient, "rename", recording_rename)
+
+        source.write_bytes(b"second version")
+        with pytest.raises(AmbiguousWriteError):
+            client.upload_file(str(source), "releases", overwrite=True)
+
+        # The generic failure was re-raised, so the non-atomic fallback never ran
+        # and the previously published file was left untouched.
+        assert rename_calls == []
+    finally:
+        client.close()
+
+    landed = sftp_server.root / "home/frs/project" / PROJECT / "releases/artifact.bin"
+    assert landed.read_bytes() == b"first"
+
+
+def test_posix_rename_unsupported_detection():
+    """Only a genuine 'unsupported' status counts as a missing extension."""
+    from legacy_mcps.sourceforge.client import _posix_rename_unsupported
+
+    assert _posix_rename_unsupported(IOError("Operation unsupported")) is True
+    assert _posix_rename_unsupported(OSError("Operation unsupported")) is True
+    # An errno-carrying failure is a real error, not a missing extension.
+    assert _posix_rename_unsupported(IOError(5, "Input/output error")) is False
+    assert _posix_rename_unsupported(IOError(13, "Permission denied")) is False
+    assert _posix_rename_unsupported(ConnectionError("reset")) is False
+    assert _posix_rename_unsupported(RuntimeError("Operation unsupported")) is False
 
 
 def test_list_files_reports_directories_and_files(sftp_server, sftp_key_file, tmp_path):
