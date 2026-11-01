@@ -359,6 +359,11 @@ def test_plain_oserror_during_upload_is_ambiguous_write(
         # extension: the broad "catch every OSError" version masked exactly this.
         OSError(errno.ECONNRESET, "Connection reset by peer"),
         paramiko.ssh_exception.SSHException("Socket is closed"),
+        # paramiko also maps these statuses to an errno-less IOError, so an
+        # errno check alone is not enough: the message must say "unsupported".
+        OSError("Failure"),  # SFTP_FAILURE
+        OSError("Connection lost"),  # SFTP_CONNECTION_LOST
+        OSError("No connection"),  # SFTP_NO_CONNECTION
     ],
 )
 def test_failure_during_posix_rename_is_not_masked(
@@ -401,6 +406,7 @@ def test_posix_rename_unsupported_detection():
     """Only a genuine 'unsupported' status counts as a missing extension."""
     from legacy_mcps.sourceforge.client import _posix_rename_unsupported
 
+    # SFTP_OP_UNSUPPORTED -> IOError("Operation unsupported"), errno None.
     assert _posix_rename_unsupported(IOError("Operation unsupported")) is True
     assert _posix_rename_unsupported(OSError("Operation unsupported")) is True
     # An errno-carrying failure is a real error, not a missing extension.
@@ -408,6 +414,12 @@ def test_posix_rename_unsupported_detection():
     assert _posix_rename_unsupported(IOError(13, "Permission denied")) is False
     assert _posix_rename_unsupported(ConnectionError("reset")) is False
     assert _posix_rename_unsupported(RuntimeError("Operation unsupported")) is False
+    # These paramiko statuses also arrive with errno None, so the message must
+    # be checked too -- otherwise a dropped connection would trigger the
+    # remove-then-rename fallback and could delete the published file.
+    assert _posix_rename_unsupported(IOError("Failure")) is False  # SFTP_FAILURE
+    assert _posix_rename_unsupported(IOError("No connection")) is False
+    assert _posix_rename_unsupported(IOError("Connection lost")) is False
 
 
 def test_list_files_reports_directories_and_files(sftp_server, sftp_key_file, tmp_path):
