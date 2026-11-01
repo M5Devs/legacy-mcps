@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "legacy-mcps"
+version = "0.1.0"
+description = "Model Context Protocol server for managing files and data on legacy platforms (Internet Archive, SourceForge)."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "M5 Devs", email = "dev@m5devs.example" }]
+keywords = ["mcp", "model-context-protocol", "internet-archive", "sourceforge", "s3", "sftp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: System :: Archiving",
+]
+dependencies = [
+    # mcp 2.x renamed FastMCP to MCPServer; this project targets the 1.x API.
+    "mcp>=1.10,<2",
+    # >=1.36 needed for the request_checksum_calculation client option, which we
+    # use to suppress AWS CRC32 headers the Internet Archive S3 gateway ignores.
+    "boto3>=1.36",
+    "paramiko>=3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+legacy-mcps = "legacy_mcps.server:main"
+
+[project.urls]
+Homepage = "https://github.com/M5Devs/legacy-mcps"
+Issues = "https://github.com/M5Devs/legacy-mcps/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/legacy_mcps"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]
