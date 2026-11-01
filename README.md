@@ -125,7 +125,13 @@ Uploads land in `/home/frs/project/<project>/<remote_dir>/` on
 `frs.sourceforge.net`. Each file is written to a temporary name and then renamed
 into place, so a partial transfer is never visible and the mirror sees a single
 completed write. `overwrite=False` (the default) refuses to replace an existing
-file.
+file; with `overwrite=True` the swap uses the `posix-rename@openssh.com`
+extension so the published file is replaced atomically.
+
+Unknown SSH host keys are **rejected** by default, so a network attacker cannot
+impersonate SourceForge. On first use, add the host key to your `known_hosts`
+(for example with `ssh -o StrictHostKeyChecking=accept-new <user>@frs.sourceforge.net`)
+or construct the client with `allow_unknown_host_key=True`.
 
 ## Response shape
 
@@ -142,8 +148,15 @@ object:
 
 `error` is one of a small stable set: `missing_credentials`, `invalid_input`,
 `file_not_found`, `remote_rejected`, `not_found`, `rate_limited`, `timeout`,
-`connection_error`, `unexpected_error`. `retryable` is true for `rate_limited`,
-`timeout` and `connection_error`, so an agent can retry without guessing.
+`connection_error`, `ambiguous_write`, `unexpected_error`. `retryable` is true
+for `rate_limited`, `timeout` and `connection_error`, so an agent can retry
+without guessing.
+
+`ambiguous_write` is the exception worth knowing about. A timeout or a dropped
+connection *during* an upload does not reveal whether the bytes arrived, so the
+file may already be published. The result carries `retryable: false` and asks
+the caller to reconcile the remote state (for example with
+`sf_list_release_files` or `ia_get_item_metadata`) before retrying.
 
 ## Project layout
 

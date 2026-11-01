@@ -20,6 +20,8 @@ from legacy_mcps.internet_archive.client import (
     validate_identifier,
 )
 from legacy_mcps.errors import (
+    AmbiguousWriteError,
+    ConnectionToolError,
     InvalidInputError,
     MissingCredentialsError,
     NotFoundError,
@@ -171,6 +173,19 @@ def test_upload_file_reports_checksums(s3_stub, tmp_path):
     assert result["sha256"] == hashlib.sha256(payload).hexdigest()
 
 
+def test_upload_file_percent_encodes_download_url(s3_stub, tmp_path):
+    source = tmp_path / "artifact.bin"
+    source.write_bytes(b"data")
+
+    result = _client(s3_stub).upload_file(
+        "test-item-4", source, remote_name="my file#1.bin"
+    )
+
+    assert result["download_url"] == (
+        "https://archive.org/download/test-item-4/my%20file%231.bin"
+    )
+
+
 def test_upload_file_rejects_missing_local_file(s3_stub, tmp_path):
     from legacy_mcps.errors import FileNotFoundToolError
 
@@ -228,11 +243,11 @@ def test_upload_translates_no_such_bucket_to_not_found(s3_stub, tmp_path):
         _client(s3_stub).upload_file("test-item-9", source)
 
 
-def test_upload_wraps_connection_failure_as_connection_error():
+def test_upload_wraps_connection_failure_as_ambiguous_write():
     # Port 1 on loopback refuses connections, which exercises the botocore
-    # EndpointConnectionError branch without needing a dead host.
-    from legacy_mcps.errors import ConnectionToolError
-
+    # EndpointConnectionError branch without needing a dead host. Because the
+    # failure happens on the write path, the outcome is unknown and the tool
+    # must not advertise it as safe to retry.
     client = InternetArchiveS3Client(
         ACCESS_KEY,
         SECRET_KEY,
@@ -240,8 +255,24 @@ def test_upload_wraps_connection_failure_as_connection_error():
         max_attempts=1,
         timeout=1.0,
     )
-    with pytest.raises(ConnectionToolError):
+    with pytest.raises(AmbiguousWriteError) as excinfo:
         client.upload_file("test-item-10", __file__)
+    assert excinfo.value.to_dict()["retryable"] is False
+
+
+def test_read_connection_failure_stays_connection_error():
+    # The same failure on a read path is plainly a connection error and is
+    # reported as retryable.
+    client = InternetArchiveS3Client(
+        ACCESS_KEY,
+        SECRET_KEY,
+        endpoint_url="http://127.0.0.1:1",
+        max_attempts=1,
+        timeout=1.0,
+    )
+    with pytest.raises(ConnectionToolError) as excinfo:
+        client.item_exists("test-item-10")
+    assert excinfo.value.to_dict()["retryable"] is True
 
 
 @pytest.mark.parametrize(
@@ -328,6 +359,29 @@ def test_fetch_metadata_requires_identifier():
         api.fetch_metadata("  ")
 
 
+def test_fetch_metadata_rejects_non_mapping_metadata(json_stub, monkeypatch):
+    monkeypatch.setattr(api, "METADATA_URL", f"{json_stub.base_url}/metadata/{{identifier}}")
+    json_stub.reply_json(200, {"metadata": "not-a-mapping", "files": []})
+
+    with pytest.raises(ConnectionToolError):
+        api.fetch_metadata("nasa")
+
+
+def test_fetch_metadata_rejects_non_list_files(json_stub, monkeypatch):
+    monkeypatch.setattr(api, "METADATA_URL", f"{json_stub.base_url}/metadata/{{identifier}}")
+    json_stub.reply_json(200, {"metadata": {"identifier": "nasa"}, "files": "nope"})
+
+    with pytest.raises(ConnectionToolError):
+        api.fetch_metadata("nasa")
+
+
+def test_fetch_metadata_allows_missing_files_field(json_stub, monkeypatch):
+    monkeypatch.setattr(api, "METADATA_URL", f"{json_stub.base_url}/metadata/{{identifier}}")
+    json_stub.reply_json(200, {"metadata": {"identifier": "nasa"}})
+
+    assert api.fetch_metadata("nasa")["metadata"]["identifier"] == "nasa"
+
+
 def test_search_items_builds_expected_query(json_stub, monkeypatch):
     monkeypatch.setattr(api, "SEARCH_URL", f"{json_stub.base_url}/advancedsearch.php")
     json_stub.reply_json(
@@ -354,6 +408,14 @@ def test_search_items_rejects_bad_paging():
         api.search_items("x", rows=0)
     with pytest.raises(InvalidInputError):
         api.search_items("x", page=0)
+
+
+def test_search_items_rejects_non_dict_response(json_stub, monkeypatch):
+    monkeypatch.setattr(api, "SEARCH_URL", f"{json_stub.base_url}/advancedsearch.php")
+    json_stub.reply_json(200, {"response": ["unexpected", "list"]})
+
+    with pytest.raises(ConnectionToolError):
+        api.search_items("collection:nasa")
 
 
 # --- tool layer -----------------------------------------------------------

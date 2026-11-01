@@ -111,6 +111,14 @@ def fetch_metadata(
             f"Item '{identifier}' was not found on archive.org.",
             detail="empty metadata document",
         )
+    files = payload.get("files")
+    if not isinstance(payload.get("metadata", {}), dict) or not (
+        files is None or isinstance(files, list)
+    ):
+        raise ConnectionToolError(
+            "Metadata response has unexpected 'metadata' or 'files' types.",
+            detail=json.dumps(payload)[:200],
+        )
     return payload
 
 
@@ -146,7 +154,7 @@ def search_items(
 
     transport = transport or _UrllibTransport()
     payload = transport.open_json(SEARCH_URL, params=params, timeout=timeout)
-    if not isinstance(payload, dict) or "response" not in payload:
+    if not isinstance(payload, dict) or not isinstance(payload.get("response"), dict):
         raise ConnectionToolError(
             "Search API returned an unexpected payload.",
             detail=json.dumps(payload)[:200] if payload is not None else "null",

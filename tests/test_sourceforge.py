@@ -14,7 +14,9 @@ from pathlib import Path
 import paramiko
 import pytest
 
+from conftest import InProcessSFTPServer
 from legacy_mcps.errors import (
+    AmbiguousWriteError,
     ConnectionToolError,
     FileNotFoundToolError,
     InvalidInputError,
@@ -40,6 +42,7 @@ def _clear_sf_env(monkeypatch):
 
 def _client(sftp_server, key_path: Path, **kwargs) -> SourceForgeFRSClient:
     """A client pointed at the in-process server, with the FRS root at /home/frs/project."""
+    kwargs.setdefault("allow_unknown_host_key", True)
     return SourceForgeFRSClient(
         username=USERNAME,
         key_path=key_path,
@@ -200,6 +203,79 @@ def test_upload_rejects_escaping_remote_directory(sftp_server, sftp_key_file, tm
         client.close()
 
 
+def test_upload_rejects_remote_name_with_separator(sftp_server, sftp_key_file, tmp_path):
+    """A 'remote_name' must be a bare file name, not a path."""
+    source = tmp_path / "artifact.bin"
+    source.write_bytes(b"data")
+
+    client = _client(sftp_server, sftp_key_file)
+    try:
+        with pytest.raises(InvalidInputError):
+            client.upload_file(str(source), "releases", remote_name="sub/file.bin")
+    finally:
+        client.close()
+
+
+def test_invalid_remote_name_does_not_create_directories(
+    sftp_server, sftp_key_file, tmp_path
+):
+    """Validation runs before the directory is made, so a bad name leaves no trace."""
+    source = tmp_path / "artifact.bin"
+    source.write_bytes(b"data")
+
+    client = _client(sftp_server, sftp_key_file)
+    try:
+        with pytest.raises(InvalidInputError):
+            client.upload_file(str(source), "releases/9.9.9", remote_name="sub/file.bin")
+    finally:
+        client.close()
+
+    assert not (sftp_server.root / "home/frs/project" / PROJECT / "releases/9.9.9").exists()
+
+
+def test_overwrite_falls_back_when_posix_rename_unsupported(tmp_path):
+    """Without the posix-rename extension the client still replaces the file."""
+    server = InProcessSFTPServer(tmp_path, supports_posix_rename=False)
+    try:
+        key_path = tmp_path / "id_rsa"
+        server.authorized_key.write_private_key_file(str(key_path))
+        key_path.chmod(0o600)
+
+        source = tmp_path / "artifact.bin"
+        source.write_bytes(b"first")
+
+        client = _client(server, key_path)
+        try:
+            client.upload_file(str(source), "releases")
+            source.write_bytes(b"second version")
+            result = client.upload_file(str(source), "releases", overwrite=True)
+        finally:
+            client.close()
+
+        assert result["size_bytes"] == len(b"second version")
+        landed = server.root / "home/frs/project" / PROJECT / "releases/artifact.bin"
+        assert landed.read_bytes() == b"second version"
+    finally:
+        server.close()
+
+
+def test_download_url_percent_encodes_path(sftp_server, sftp_key_file, tmp_path):
+    """Spaces and '#' in a release name must not break the download URL."""
+    source = tmp_path / "artifact.bin"
+    source.write_bytes(b"data")
+
+    client = _client(sftp_server, sftp_key_file)
+    try:
+        result = client.upload_file(str(source), "releases", remote_name="my file#1.bin")
+    finally:
+        client.close()
+
+    assert result["download_url"] == (
+        f"https://sourceforge.net/projects/{PROJECT}/files/"
+        "releases/my%20file%231.bin/download"
+    )
+
+
 def test_list_files_reports_directories_and_files(sftp_server, sftp_key_file, tmp_path):
     source = tmp_path / "release.bin"
     source.write_bytes(b"0123456789")
@@ -323,6 +399,7 @@ def test_rejected_key_maps_to_remote_rejected(sftp_server, tmp_path):
         timeout=5.0,
         allow_agent=False,
         look_for_keys=False,
+        allow_unknown_host_key=True,
     )
     try:
         with pytest.raises(RemoteRejectedError) as excinfo:
@@ -350,6 +427,32 @@ def test_refused_connection_maps_to_connection_error(tmp_path):
     try:
         with pytest.raises(ConnectionToolError):
             client.list_files()
+    finally:
+        client.close()
+
+
+def test_write_timeout_maps_to_ambiguous_write(tmp_path):
+    """A timeout during a write is not safe to retry blindly."""
+    key = tmp_path / "id_rsa"
+    paramiko.RSAKey.generate(2048).write_private_key_file(str(key))
+    key.chmod(0o600)
+
+    client = SourceForgeFRSClient(username=USERNAME, key_path=key, project=PROJECT)
+    try:
+        translated = client._translate_ssh_error(
+            paramiko.ssh_exception.SSHException("timed out"),
+            action="upload a file",
+            during_write=True,
+        )
+        assert isinstance(translated, AmbiguousWriteError)
+        assert translated.to_dict()["retryable"] is False
+
+        # The same error on a read path stays a plain, retryable timeout.
+        translated = client._translate_ssh_error(
+            paramiko.ssh_exception.SSHException("timed out"), action="list a directory"
+        )
+        assert translated.to_dict()["error"] == "timeout"
+        assert translated.to_dict()["retryable"] is True
     finally:
         client.close()
 
@@ -411,6 +514,57 @@ def test_tool_upload_reports_missing_local_file_as_payload(
 
     assert result["ok"] is False
     assert result["error"] == "file_not_found"
+
+
+def test_tool_upload_reports_missing_key_file_as_payload(monkeypatch, tmp_path):
+    """A typo in SF_SSH_KEY_PATH must surface as file_not_found, not raise."""
+    monkeypatch.setenv(tools.USERNAME_ENV, USERNAME)
+    monkeypatch.setenv(tools.SSH_KEY_PATH_ENV, str(tmp_path / "no-such-key"))
+    monkeypatch.setenv(tools.PROJECT_NAME_ENV, PROJECT)
+
+    source = tmp_path / "artifact.bin"
+    source.write_bytes(b"data")
+
+    result = tools.upload_release_file(str(source), "releases")
+
+    assert result["ok"] is False
+    assert result["error"] == "file_not_found"
+    assert result["retryable"] is False
+
+
+def test_tool_list_reports_missing_key_file_as_payload(monkeypatch, tmp_path):
+    monkeypatch.setenv(tools.USERNAME_ENV, USERNAME)
+    monkeypatch.setenv(tools.SSH_KEY_PATH_ENV, str(tmp_path / "no-such-key"))
+    monkeypatch.setenv(tools.PROJECT_NAME_ENV, PROJECT)
+
+    result = tools.list_release_files()
+
+    assert result["ok"] is False
+    assert result["error"] == "file_not_found"
+
+
+def test_unknown_host_key_is_rejected_by_default(monkeypatch, sftp_server, tmp_path):
+    """Without an opt-in, a host whose key is not in known_hosts is refused."""
+    key = tmp_path / "id_rsa"
+    sftp_server.authorized_key.write_private_key_file(str(key))
+    key.chmod(0o600)
+
+    client = SourceForgeFRSClient(
+        username=USERNAME,
+        key_path=key,
+        project=PROJECT,
+        host=sftp_server.host,
+        port=sftp_server.port,
+        timeout=5.0,
+        allow_agent=False,
+        look_for_keys=False,
+    )
+    try:
+        with pytest.raises(ConnectionToolError) as excinfo:
+            client.list_files()
+        assert "host key" in excinfo.value.message.lower()
+    finally:
+        client.close()
 
 
 def test_has_credentials_requires_all_three(monkeypatch):

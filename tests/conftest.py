@@ -121,7 +121,14 @@ class _JailedSFTPInterface(SFTPServerInterface):
             return SFTPServer.convert_errno(exc.errno)
         return paramiko.SFTP_OK
 
-    posix_rename = rename
+    #: Set to False by the server to emulate an SFTP server without the
+    #: posix-rename@openssh.com extension.
+    supports_posix_rename = True
+
+    def posix_rename(self, oldpath, newpath):
+        if not self.supports_posix_rename:
+            return paramiko.SFTP_OP_UNSUPPORTED
+        return self.rename(oldpath, newpath)
 
 
 class _LocalHandle(SFTPHandle):
@@ -166,8 +173,9 @@ class _AcceptKeyServer(paramiko.ServerInterface):
 class InProcessSFTPServer:
     """A throwaway SSH/SFTP server on 127.0.0.1 serving ``root``."""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, supports_posix_rename: bool = True):
         self.root = Path(root).resolve()
+        self.supports_posix_rename = supports_posix_rename
         self.host_key = paramiko.RSAKey.generate(2048)
         self.authorized_key = paramiko.RSAKey.generate(2048)
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -191,11 +199,13 @@ class InProcessSFTPServer:
 
     def _handle_client(self, client_socket: socket.socket) -> None:
         root = self.root
+        supports_posix_rename = self.supports_posix_rename
 
         class _Interface(_JailedSFTPInterface):
             def __init__(self, server, *args, **kwargs):
                 super().__init__(server, *args, **kwargs)
                 self.root = root
+                self.supports_posix_rename = supports_posix_rename
 
         transport = paramiko.Transport(client_socket)
         transport.add_server_key(self.host_key)
@@ -246,6 +256,16 @@ def sftp_key_file(tmp_path_factory, sftp_server) -> Path:
     sftp_server.authorized_key.write_private_key_file(str(key_path))
     key_path.chmod(0o600)
     return key_path
+
+
+@pytest.fixture
+def sftp_server_no_posix_rename(tmp_path):
+    """An SFTP server that rejects posix-rename@openssh.com."""
+    server = InProcessSFTPServer(tmp_path, supports_posix_rename=False)
+    try:
+        yield server
+    finally:
+        server.close()
 
 
 # --- Internet Archive S3 stub ---------------------------------------------

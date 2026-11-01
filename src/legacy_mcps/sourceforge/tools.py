@@ -10,7 +10,6 @@ from typing import Any
 
 from legacy_mcps.errors import (
     ERROR_MISSING_CREDENTIALS,
-    MissingCredentialsError,
     read_env,
     require_env,
     to_error_payload,
@@ -72,8 +71,8 @@ def upload_release_file(
     """
     try:
         client = _client()
-    except MissingCredentialsError as exc:
-        return exc.to_dict()
+    except Exception as exc:  # noqa: BLE001 - tools must never raise
+        return to_error_payload(exc)
     try:
         return client.upload_file(
             local_path, remote_dir, remote_name=remote_name, overwrite=overwrite
@@ -98,8 +97,8 @@ def list_release_files(remote_dir: str = "", limit: int = 200) -> dict[str, Any]
     """
     try:
         client = _client()
-    except MissingCredentialsError as exc:
-        return exc.to_dict()
+    except Exception as exc:  # noqa: BLE001 - tools must never raise
+        return to_error_payload(exc)
     try:
         return client.list_files(remote_dir, limit=limit)
     except Exception as exc:  # noqa: BLE001 - tools must never raise

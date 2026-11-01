@@ -30,7 +30,7 @@ dependencies = [
     # >=1.36 needed for the request_checksum_calculation client option, which we
     # use to suppress AWS CRC32 headers the Internet Archive S3 gateway ignores.
     "boto3>=1.36",
-    "paramiko>=3.0",
+    "paramiko>=3.2",
 ]
 
 [project.optional-dependencies]

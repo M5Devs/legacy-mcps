@@ -72,6 +72,8 @@ def upload_file(
         client = _client()
     except MissingCredentialsError as exc:
         return exc.to_dict()
+    except Exception as exc:  # noqa: BLE001 - tools must never raise
+        return to_error_payload(exc)
     try:
         return client.upload_file(
             identifier,

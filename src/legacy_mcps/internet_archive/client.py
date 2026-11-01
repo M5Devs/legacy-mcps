@@ -22,6 +22,7 @@ from typing import Any
 from urllib.parse import quote
 
 from legacy_mcps.errors import (
+    AmbiguousWriteError,
     ConnectionToolError,
     FileNotFoundToolError,
     InvalidInputError,
@@ -159,8 +160,16 @@ def checksums_for(path: Path) -> tuple[str, str, int]:
     return md5.hexdigest(), sha256.hexdigest(), size
 
 
-def translate_boto_error(exc: BaseException, *, identifier: str = "") -> Exception:
-    """Map a botocore exception onto this package's error hierarchy."""
+def translate_boto_error(
+    exc: BaseException, *, identifier: str = "", during_write: bool = False
+) -> Exception:
+    """Map a botocore exception onto this package's error hierarchy.
+
+    ``during_write`` marks a failure that happened while an upload was in
+    flight. A timeout or a dropped connection there does not tell us whether the
+    bytes arrived, so the result is reported as an ambiguous write rather than a
+    plain timeout/connection error, and is not advertised as safe to retry.
+    """
     try:
         from botocore import exceptions as boto_errors
     except ImportError:  # pragma: no cover - boto3 is a declared dependency
@@ -170,6 +179,13 @@ def translate_boto_error(exc: BaseException, *, identifier: str = "") -> Excepti
         return InvalidInputError(f"Invalid request parameters: {exc}", detail=str(exc))
 
     if isinstance(exc, (boto_errors.ReadTimeoutError, boto_errors.ConnectTimeoutError)):
+        if during_write:
+            return AmbiguousWriteError(
+                "The upload to the Internet Archive timed out and its outcome is "
+                "unknown: the file may already be stored. Check the item before "
+                "retrying.",
+                detail=str(exc),
+            )
         return TimeoutToolError(
             "The Internet Archive S3 gateway did not respond in time.",
             detail=str(exc),
@@ -185,6 +201,13 @@ def translate_boto_error(exc: BaseException, *, identifier: str = "") -> Excepti
             boto_errors.HTTPClientError,
         ),
     ):
+        if during_write:
+            return AmbiguousWriteError(
+                "The connection to the Internet Archive dropped during the "
+                "upload and its outcome is unknown: the file may already be "
+                "stored. Check the item before retrying.",
+                detail=str(exc),
+            )
         return ConnectionToolError(
             "Could not reach the Internet Archive S3 gateway.", detail=str(exc)
         )
@@ -359,7 +382,9 @@ class InternetArchiveS3Client:
             with path.open("rb") as body:
                 response = client.put_object(Bucket=identifier, Key=key, Body=body)
         except Exception as exc:
-            raise translate_boto_error(exc, identifier=identifier) from exc
+            raise translate_boto_error(
+                exc, identifier=identifier, during_write=True
+            ) from exc
         finally:
             try:
                 events.unregister("before-sign.s3.PutObject", unique_id=unique_id)
@@ -383,7 +408,7 @@ class InternetArchiveS3Client:
             "sha256": sha256,
             "etag": etag,
             "details_url": f"https://archive.org/details/{identifier}",
-            "download_url": f"https://archive.org/download/{identifier}/{key}",
+            "download_url": f"https://archive.org/download/{identifier}/{quote(key, safe='/')}",
         }
 
     def item_exists(self, identifier: str) -> bool:

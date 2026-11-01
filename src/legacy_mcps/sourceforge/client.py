@@ -30,8 +30,10 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from legacy_mcps.errors import (
+    AmbiguousWriteError,
     ConnectionToolError,
     FileNotFoundToolError,
     InvalidInputError,
@@ -145,6 +147,7 @@ class SourceForgeFRSClient:
         timeout: float = DEFAULT_TIMEOUT,
         allow_agent: bool = True,
         look_for_keys: bool = True,
+        allow_unknown_host_key: bool = False,
         ssh_client: Any | None = None,
     ) -> None:
         if not username:
@@ -172,6 +175,7 @@ class SourceForgeFRSClient:
         self.timeout = timeout
         self.allow_agent = allow_agent
         self.look_for_keys = look_for_keys
+        self.allow_unknown_host_key = allow_unknown_host_key
         self._ssh_client = ssh_client
         self._sftp: Any | None = None
         self._owns_client = ssh_client is None
@@ -197,7 +201,12 @@ class SourceForgeFRSClient:
         if client is None:
             client = paramiko.SSHClient()
             client.load_system_host_keys()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            policy = (
+                paramiko.AutoAddPolicy()
+                if self.allow_unknown_host_key
+                else paramiko.RejectPolicy()
+            )
+            client.set_missing_host_key_policy(policy)
             self._ssh_client = client
 
         transport = getattr(client, "_transport", None)
@@ -233,7 +242,9 @@ class SourceForgeFRSClient:
         if self._key_path is None:
             return None
         try:
-            return paramiko.PKey.from_path(self._key_path, password=self._password)
+            # Pass the passphrase positionally: paramiko renamed the keyword from
+            # ``passphrase`` (3.2-4.x) to ``password`` (5.x).
+            return paramiko.PKey.from_path(self._key_path, self._password)
         except Exception as exc:
             raise InvalidInputError(
                 f"Could not read the SSH private key at {self._key_path}: {exc}",
@@ -259,7 +270,9 @@ class SourceForgeFRSClient:
                 pass
         self._sftp = None
 
-    def _translate_ssh_error(self, exc: BaseException, *, action: str) -> Exception:
+    def _translate_ssh_error(
+        self, exc: BaseException, *, action: str, during_write: bool = False
+    ) -> Exception:
         try:
             import paramiko
         except ImportError:  # pragma: no cover - dependency is declared
@@ -278,6 +291,16 @@ class SourceForgeFRSClient:
                 "entry. Verify the host key before retrying.",
                 detail=str(exc),
             )
+        if isinstance(exc, paramiko.ssh_exception.SSHException) and (
+            "not found in known_hosts" in str(exc)
+        ):
+            return ConnectionToolError(
+                f"The SSH host key for {self.host} is not in known_hosts, so the "
+                "connection was refused. Verify the host key first (for example "
+                "with 'ssh-keyscan'), or set allow_unknown_host_key=True to trust "
+                "it on first use.",
+                detail=str(exc),
+            )
         if isinstance(exc, paramiko.ssh_exception.NoValidConnectionsError):
             return ConnectionToolError(
                 f"Could not open a TCP connection to {self.host}:{self.port}.",
@@ -287,6 +310,13 @@ class SourceForgeFRSClient:
             isinstance(exc, paramiko.ssh_exception.SSHException)
             and "timed out" in str(exc).lower()
         ):
+            if during_write:
+                return AmbiguousWriteError(
+                    "The upload timed out and its outcome is unknown: the file "
+                    "may already be published. List the release directory before "
+                    "retrying.",
+                    detail=str(exc),
+                )
             return TimeoutToolError(
                 f"Timed out talking to {self.host}:{self.port}.", detail=str(exc)
             )
@@ -302,6 +332,15 @@ class SourceForgeFRSClient:
                     "project admin or have the 'release technician' permission.",
                     detail=str(exc),
                 )
+        if during_write and isinstance(
+            exc, (EOFError, ConnectionError, paramiko.ssh_exception.SSHException)
+        ):
+            return AmbiguousWriteError(
+                "The connection dropped during the upload and its outcome is "
+                "unknown: the file may already be published. List the release "
+                "directory before retrying.",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
         return ConnectionToolError(
             f"Could not {action} on {self.host}: {exc}",
             detail=f"{type(exc).__name__}: {exc}",
@@ -355,11 +394,16 @@ class SourceForgeFRSClient:
         if not path.is_file():
             raise FileNotFoundToolError(f"Not a regular file: {path}")
 
-        directory = self.ensure_remote_directory(remote_dir)
         name = remote_name if remote_name is not None else path.name
         if not name:
             raise InvalidInputError("'remote_name' must not be blank.")
         name = validate_remote_path(name)
+        if "/" in name or name == ".":
+            raise InvalidInputError(
+                "'remote_name' must be a single file name, not a path.",
+                detail=f"got {name!r}",
+            )
+        directory = self.ensure_remote_directory(remote_dir)
 
         destination = posixpath.join(directory, name)
         staging = f"{destination}.part-{os.getpid()}"
@@ -373,22 +417,37 @@ class SourceForgeFRSClient:
                 )
             try:
                 sftp.put(str(path), staging, callback=progress_callback)
-                if self._exists(sftp, destination):
-                    sftp.remove(destination)
-                sftp.rename(staging, destination)
+                if overwrite:
+                    try:
+                        # posix-rename@openssh.com replaces the target atomically,
+                        # so the published file is never missing mid-swap.
+                        sftp.posix_rename(staging, destination)
+                    except IOError:
+                        # Server lacks the extension: fall back to remove+rename.
+                        if self._exists(sftp, destination):
+                            sftp.remove(destination)
+                        sftp.rename(staging, destination)
+                else:
+                    sftp.rename(staging, destination)
             except Exception as exc:
-                raise self._translate_ssh_error(exc, action="upload a file") from exc
+                raise self._translate_ssh_error(
+                    exc, action="upload a file", during_write=True
+                ) from exc
         finally:
             self._cleanup_staging(sftp, staging)
 
         size = path.stat().st_size
+        relative = posixpath.relpath(destination, self.project_root)
         return {
             "ok": True,
             "project": self.project,
             "remote_path": destination,
             "filename": name,
             "size_bytes": size,
-            "download_url": f"https://sourceforge.net/projects/{self.project}/files/{posixpath.relpath(destination, self.project_root)}/download",
+            "download_url": (
+                f"https://sourceforge.net/projects/{quote(self.project)}/files/"
+                f"{quote(relative)}/download"
+            ),
             "note": (
                 "SourceForge mirrors new releases within a few minutes; the "
                 "download URL only serves the file after mirror propagation."

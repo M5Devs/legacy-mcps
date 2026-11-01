@@ -28,6 +28,9 @@ ERROR_RATE_LIMITED = "rate_limited"
 ERROR_TIMEOUT = "timeout"
 #: DNS/TCP/TLS level failure, or the connection dropped mid-transfer.
 ERROR_CONNECTION = "connection_error"
+#: A write failed in a way that leaves the remote state unknown, so it is unsafe
+#: to blindly retry: the transfer may have completed before the failure.
+ERROR_AMBIGUOUS_WRITE = "ambiguous_write"
 #: Anything we could not classify. ``detail`` carries the raw message.
 ERROR_UNEXPECTED = "unexpected_error"
 
@@ -98,6 +101,17 @@ class TimeoutToolError(LegacyMCPError):
 
 class ConnectionToolError(LegacyMCPError):
     code = ERROR_CONNECTION
+
+
+class AmbiguousWriteError(LegacyMCPError):
+    """A write failed after the remote state may already have changed.
+
+    A timeout or a dropped connection during an upload does not tell us whether
+    the bytes arrived. Retrying is not obviously safe: the first attempt may
+    have completed. Callers should reconcile the remote state before retrying.
+    """
+
+    code = ERROR_AMBIGUOUS_WRITE
 
 
 # --- credential helpers ----------------------------------------------------
